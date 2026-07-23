@@ -1,0 +1,20 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^node --check \\.\\\\src\\\\index\\.js; node --check \\.\\\\src\\\\renderer\\.js; node --check \\.\\\\src\\\\preload\\.js; node -e \"const fs=require\\('fs'\\); const text=fs\\.readFileSync\\('src/renderer\\.js','utf8'\\); if \\(!text\\.includes\\('function parseExtractorOutput'\\)\\) process\\.exit\\(1\\); console\\.log\\('renderer parser present'\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node --check \\.\\\\src\\\\renderer\\.js; npm run package$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node --check \\.\\\\src\\\\renderer\\.js; npm\\.cmd run package$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node --check \\.\\\\src\\\\index\\.js; node --check \\.\\\\src\\\\renderer\\.js; node --check \\.\\\\src\\\\preload\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

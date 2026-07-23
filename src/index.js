@@ -1,0 +1,949 @@
+'use strict';
+
+const {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+} = require('electron');
+
+const {
+  spawn,
+} = require('node:child_process');
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+
+let mainWindow = null;
+let extractionProcess = null;
+let outputWatcher = null;
+let outputScanTimer = null;
+let cancellationRequested = false;
+
+let detectedTrackFiles = new Set();
+let initialAudioFiles = new Set();
+let initialAudioFileStats = new Map();
+let trackCounter = 0;
+
+
+/*
+ * Send an IPC message only if the renderer window still exists.
+ */
+function sendToRenderer(channel, payload) {
+  if (
+    !mainWindow ||
+    mainWindow.isDestroyed()
+  ) {
+    return;
+  }
+
+  mainWindow.webContents.send(
+    channel,
+    payload
+  );
+}
+
+
+/*
+ * Send extractor output to both:
+ *
+ * 1. the terminal where npm start was launched;
+ * 2. the Extraction log in the renderer.
+ */
+function sendExtractorOutput(source, data) {
+  const text = Buffer.isBuffer(data)
+    ? data.toString('utf8')
+    : String(data ?? '');
+
+  if (!text) {
+    return;
+  }
+
+  if (source === 'stderr') {
+    process.stderr.write(text);
+  } else {
+    process.stdout.write(text);
+  }
+
+  sendToRenderer(
+    'sacd:output',
+    text
+  );
+}
+
+
+/*
+ * Create the main application window.
+ */
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1000,
+    height: 760,
+
+    minWidth: 850,
+    minHeight: 650,
+
+    backgroundColor: '#101419',
+
+    webPreferences: {
+      preload: path.join(
+        __dirname,
+        'preload.js'
+      ),
+
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  mainWindow.loadFile(
+    path.join(
+      __dirname,
+      'index.html'
+    )
+  );
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+
+  // Для отладки можно временно включить:
+  // mainWindow.webContents.openDevTools();
+}
+
+
+/*
+ * Locate sacd_extract.exe.
+ *
+ * During development it will normally be located here:
+ *
+ *   project\
+ *       sacd_extract.exe
+ *       src\
+ *           index.js
+ *
+ * During packaging it may be placed into process.resourcesPath.
+ */
+function getExtractorPath() {
+  const candidates = [
+    path.join(
+      __dirname,
+      '..',
+      'sacd_extract.exe'
+    ),
+
+    path.join(
+      __dirname,
+      'sacd_extract.exe'
+    ),
+
+    path.join(
+      process.resourcesPath,
+      'sacd_extract.exe'
+    ),
+  ];
+
+  const extractorPath = candidates.find(
+    (candidate) => fs.existsSync(candidate)
+  );
+
+  if (!extractorPath) {
+    throw new Error(
+      'sacd_extract.exe was not found.\n\n' +
+      'Checked locations:\n' +
+      candidates.join('\n')
+    );
+  }
+
+  return extractorPath;
+}
+
+
+/*
+ * Build sacd_extract command-line arguments.
+ */
+function buildExtractorArguments(options) {
+  const args = [
+    '-i',
+    options.source,
+  ];
+
+  /*
+   * Output format.
+   */
+  if (options.format === 'dsf') {
+    args.push('-s', '-y', options.output);
+  } else if (options.format === 'dff') {
+    args.push('-p', '-y', options.output);
+  } else {
+    args.push('-s', '-y', options.output);
+  }
+
+  /*
+   * SACD area.
+   */
+  if (options.area === 'stereo') {
+    args.push('-2');
+  } else if (options.area === 'multichannel') {
+    args.push('-m');
+  } else if (options.area === 'both') {
+    args.push('-2', '-m');
+  }
+
+  if (options.decodeDst) {
+    args.push('-c');
+  }
+
+  if (options.exportCuesheet) {
+    args.push('-C');
+  }
+
+  return args;
+}
+
+
+/*
+ * Return true for extracted audio files.
+ */
+function isExtractedAudioFile(filename) {
+  const extension =
+    path.extname(filename).toLowerCase();
+
+  return (
+    extension === '.dsf' ||
+    extension === '.dff'
+  );
+}
+
+
+/*
+ * Recursively enumerate existing DSF/DFF files.
+ *
+ * This prevents old files already present in the destination from
+ * being counted as tracks created by the current extraction.
+ */
+function collectAudioFiles(directory) {
+  const result = new Set();
+
+  function scan(currentDirectory) {
+    let entries;
+
+    try {
+      entries = fs.readdirSync(
+        currentDirectory,
+        {
+          withFileTypes: true,
+        }
+      );
+    } catch (error) {
+      console.warn(
+        `Unable to scan directory "${currentDirectory}":`,
+        error.message
+      );
+
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(
+        currentDirectory,
+        entry.name
+      );
+
+      if (entry.isDirectory()) {
+        scan(fullPath);
+        continue;
+      }
+
+      if (
+        entry.isFile() &&
+        isExtractedAudioFile(entry.name)
+      ) {
+        result.add(
+          path.normalize(fullPath)
+        );
+      }
+    }
+  }
+
+  scan(directory);
+
+  return result;
+}
+
+
+/*
+ * Stop watching the output folder.
+ */
+function stopOutputWatcher() {
+  if (outputWatcher) {
+    try {
+      outputWatcher.close();
+    } catch (error) {
+      console.warn(
+        'Unable to close output watcher:',
+        error.message
+      );
+    }
+
+    outputWatcher = null;
+  }
+
+  if (outputScanTimer) {
+    clearInterval(outputScanTimer);
+    outputScanTimer = null;
+  }
+}
+
+
+/*
+ * Report a newly created DSF/DFF file as a track.
+ *
+ * sacd_extract Windows builds do not always write progress information
+ * to redirected stdout/stderr. Watching the destination directory gives
+ * us a reliable fallback.
+ */
+function reportDetectedTrack(fullPath) {
+  const normalizedPath =
+    path.normalize(fullPath);
+
+  if (detectedTrackFiles.has(normalizedPath)) {
+    return;
+  }
+
+  let stats;
+
+  try {
+    stats = fs.statSync(normalizedPath);
+  } catch {
+    /*
+     * A filesystem notification may arrive before the file is fully
+     * visible. Another notification normally follows.
+     */
+    return;
+  }
+
+  if (!stats.isFile()) {
+    return;
+  }
+
+  const initialStats =
+    initialAudioFileStats.get(normalizedPath);
+
+  if (
+    initialStats &&
+    initialStats.size === stats.size &&
+    initialStats.mtimeMs === stats.mtimeMs
+  ) {
+    return;
+  }
+
+  detectedTrackFiles.add(normalizedPath);
+  trackCounter += 1;
+
+  const filename =
+    path.basename(normalizedPath);
+
+  const message =
+    `\nTrack ${trackCounter}: ${filename}\n`;
+
+  console.log(
+    `[watcher] ${message.trim()}`
+  );
+
+  sendToRenderer(
+    'sacd:output',
+    message
+  );
+
+  /*
+   * Send a dedicated event as well. The renderer may use it directly
+   * later instead of parsing the log.
+   */
+  sendToRenderer(
+    'sacd:track',
+    {
+      number: trackCounter,
+      filename,
+      path: normalizedPath,
+    }
+  );
+}
+
+
+/*
+ * Polling complements fs.watch because some extractor builds create files
+ * in nested directories without producing a usable recursive event.
+ */
+function scanOutputForTracks(outputDirectory) {
+  const currentAudioFiles =
+    collectAudioFiles(outputDirectory);
+
+  for (const fullPath of currentAudioFiles) {
+    reportDetectedTrack(fullPath);
+  }
+}
+
+
+/*
+ * Start watching the output directory recursively.
+ *
+ * Recursive fs.watch is supported on Windows.
+ */
+function startOutputWatcher(outputDirectory) {
+  stopOutputWatcher();
+
+  initialAudioFiles =
+    collectAudioFiles(outputDirectory);
+
+  initialAudioFileStats = new Map();
+
+  for (const fullPath of initialAudioFiles) {
+    try {
+      const stats = fs.statSync(fullPath);
+
+      initialAudioFileStats.set(
+        fullPath,
+        {
+          size: stats.size,
+          mtimeMs: stats.mtimeMs,
+        }
+      );
+    } catch {
+      // The file may disappear between the directory scan and stat().
+    }
+  }
+
+  detectedTrackFiles = new Set();
+  initialAudioFileStats = new Map();
+  trackCounter = 0;
+
+  try {
+    outputWatcher = fs.watch(
+      outputDirectory,
+      {
+        recursive: true,
+      },
+
+      (_eventType, filename) => {
+        if (!filename) {
+          return;
+        }
+
+        const relativeName =
+          filename.toString();
+
+        if (!isExtractedAudioFile(relativeName)) {
+          return;
+        }
+
+        const fullPath = path.join(
+          outputDirectory,
+          relativeName
+        );
+
+        /*
+         * Delay slightly because sacd_extract may have created the
+         * directory entry but not yet opened or populated the file.
+         */
+        setTimeout(
+          () => {
+            reportDetectedTrack(fullPath);
+          },
+          150
+        );
+      }
+    );
+
+    outputWatcher.on(
+      'error',
+      (error) => {
+        console.warn(
+          'Output watcher error:',
+          error.message
+        );
+
+        sendToRenderer(
+          'sacd:output',
+          `\n[watcher] ${error.message}\n`
+        );
+      }
+    );
+
+    console.log(
+      'Watching output directory:',
+      outputDirectory
+    );
+
+  } catch (error) {
+    console.warn(
+      'Unable to watch output directory:',
+      error.message
+    );
+
+    sendToRenderer(
+      'sacd:output',
+      `\n[watcher unavailable] ${error.message}\n`
+    );
+  }
+
+  scanOutputForTracks(outputDirectory);
+
+  outputScanTimer = setInterval(
+    () => {
+      scanOutputForTracks(outputDirectory);
+    },
+    500
+  );
+}
+
+
+/*
+ * Clean up state after the process has exited.
+ */
+function clearExtractionState() {
+  stopOutputWatcher();
+
+  extractionProcess = null;
+  cancellationRequested = false;
+
+  detectedTrackFiles = new Set();
+  initialAudioFiles = new Set();
+  trackCounter = 0;
+}
+
+
+/*
+ * ISO file selection.
+ */
+ipcMain.handle(
+  'dialog:select-iso',
+
+  async () => {
+    const result =
+      await dialog.showOpenDialog({
+        title: 'Select SACD ISO',
+
+        properties: [
+          'openFile',
+        ],
+
+        filters: [
+          {
+            name: 'SACD ISO images',
+            extensions: ['iso'],
+          },
+
+          {
+            name: 'All files',
+            extensions: ['*'],
+          },
+        ],
+      });
+
+    if (
+      result.canceled ||
+      result.filePaths.length === 0
+    ) {
+      return null;
+    }
+
+    return result.filePaths[0];
+  }
+);
+
+
+/*
+ * Output directory selection.
+ */
+ipcMain.handle(
+  'dialog:select-output',
+
+  async () => {
+    const result =
+      await dialog.showOpenDialog({
+        title: 'Select output directory',
+
+        properties: [
+          'openDirectory',
+          'createDirectory',
+        ],
+      });
+
+    if (
+      result.canceled ||
+      result.filePaths.length === 0
+    ) {
+      return null;
+    }
+
+    return result.filePaths[0];
+  }
+);
+
+
+/*
+ * Start extraction.
+ */
+ipcMain.handle(
+  'sacd:start-extraction',
+
+  async (_event, options) => {
+    if (extractionProcess) {
+      return {
+        success: false,
+        error:
+          'An extraction is already running.',
+      };
+    }
+
+    try {
+      if (!options?.source) {
+        throw new Error(
+          'No source ISO was selected.'
+        );
+      }
+
+      if (!options?.output) {
+        throw new Error(
+          'No destination directory was selected.'
+        );
+      }
+
+      if (!fs.existsSync(options.source)) {
+        throw new Error(
+          'The source ISO does not exist:\n' +
+          options.source
+        );
+      }
+
+      if (!fs.existsSync(options.output)) {
+        throw new Error(
+          'The destination directory does not exist:\n' +
+          options.output
+        );
+      }
+
+      const sourceStats =
+        fs.statSync(options.source);
+
+      if (!sourceStats.isFile()) {
+        throw new Error(
+          'The selected source is not a file:\n' +
+          options.source
+        );
+      }
+
+      const outputStats =
+        fs.statSync(options.output);
+
+      if (!outputStats.isDirectory()) {
+        throw new Error(
+          'The selected destination is not a directory:\n' +
+          options.output
+        );
+      }
+
+      const extractorPath =
+        getExtractorPath();
+
+      const args =
+        buildExtractorArguments(options);
+
+      console.log(
+        'Executable:',
+        extractorPath
+      );
+
+      console.log(
+        'Arguments:',
+        args
+      );
+
+      cancellationRequested = false;
+
+      /*
+       * Start watcher before spawning the extractor so that very early
+       * output files cannot be missed.
+       */
+      startOutputWatcher(
+        options.output
+      );
+
+      sendToRenderer(
+        'sacd:status',
+        {
+          state: 'running',
+          message: 'Extraction started',
+        }
+      );
+
+      const displayedCommand = [
+        `"${extractorPath}"`,
+
+        ...args.map((argument) => {
+          const value = String(argument);
+
+          return value.includes(' ')
+            ? `"${value}"`
+            : value;
+        }),
+      ].join(' ');
+
+      sendToRenderer(
+        'sacd:output',
+        `Starting:\n${displayedCommand}\n\n`
+      );
+
+      extractionProcess = spawn(
+        extractorPath,
+        args,
+        {
+          /*
+           * Use the executable directory as cwd. Some Windows binaries
+           * expect DLLs or auxiliary files beside the executable.
+           */
+          cwd: path.dirname(
+            extractorPath
+          ),
+
+          windowsHide: true,
+          shell: false,
+
+          /*
+           * Explicitly create pipes for stdout and stderr.
+           */
+          stdio: [
+            'ignore',
+            'pipe',
+            'pipe',
+          ],
+        }
+      );
+
+      extractionProcess.stdout.on(
+        'data',
+
+        (data) => {
+          sendExtractorOutput(
+            'stdout',
+            data
+          );
+        }
+      );
+
+      extractionProcess.stderr.on(
+        'data',
+
+        (data) => {
+          sendExtractorOutput(
+            'stderr',
+            data
+          );
+        }
+      );
+
+      extractionProcess.on(
+        'error',
+
+        (error) => {
+          console.error(
+            'Unable to start sacd_extract:',
+            error
+          );
+
+          sendToRenderer(
+            'sacd:output',
+            `\nError: ${error.message}\n`
+          );
+
+          sendToRenderer(
+            'sacd:status',
+            {
+              state: 'error',
+              message: error.message,
+            }
+          );
+
+          clearExtractionState();
+        }
+      );
+
+      extractionProcess.on(
+        'close',
+
+        (exitCode, signal) => {
+          console.log(
+            'sacd_extract finished:',
+            {
+              exitCode,
+              signal,
+              cancellationRequested,
+            }
+          );
+
+          /*
+           * Keep a local copy because clearExtractionState resets it.
+           */
+          const wasCancelled =
+            cancellationRequested;
+
+          if (wasCancelled) {
+            sendToRenderer(
+              'sacd:status',
+              {
+                state: 'cancelled',
+                message:
+                  'Extraction was cancelled.',
+                exitCode,
+                signal,
+              }
+            );
+          } else if (exitCode === 0) {
+            sendToRenderer(
+              'sacd:status',
+              {
+                state: 'completed',
+                message:
+                  'Extraction completed successfully.',
+                exitCode,
+                signal,
+              }
+            );
+          } else {
+            sendToRenderer(
+              'sacd:status',
+              {
+                state: 'error',
+
+                message:
+                  'Extraction failed with exit code ' +
+                  `${exitCode}.`,
+
+                exitCode,
+                signal,
+              }
+            );
+          }
+
+          sendToRenderer(
+            'sacd:output',
+            '\nProcess finished with exit code ' +
+            `${exitCode}.\n`
+          );
+
+          clearExtractionState();
+        }
+      );
+
+      return {
+        success: true,
+        executable: extractorPath,
+        arguments: args,
+      };
+    } catch (error) {
+      console.error(error);
+
+      clearExtractionState();
+
+      return {
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      };
+    }
+  }
+);
+
+
+/*
+ * Stop extraction.
+ */
+ipcMain.handle(
+  'sacd:stop-extraction',
+
+  async () => {
+    if (!extractionProcess) {
+      return {
+        success: false,
+        error:
+          'No extraction is running.',
+      };
+    }
+
+    cancellationRequested = true;
+
+    let stopped = false;
+
+    try {
+      stopped =
+        extractionProcess.kill();
+    } catch (error) {
+      return {
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      };
+    }
+
+    return {
+      success: stopped,
+
+      error: stopped
+        ? undefined
+        : 'Windows did not terminate the process.',
+    };
+  }
+);
+
+
+/*
+ * Electron lifecycle.
+ */
+app.whenReady().then(() => {
+  createWindow();
+
+  app.on('activate', () => {
+    if (
+      BrowserWindow.getAllWindows()
+        .length === 0
+    ) {
+      createWindow();
+    }
+  });
+});
+
+
+app.on(
+  'before-quit',
+
+  () => {
+    stopOutputWatcher();
+
+    if (extractionProcess) {
+      cancellationRequested = true;
+
+      try {
+        extractionProcess.kill();
+      } catch {
+        // Process may already have exited.
+      }
+    }
+  }
+);
+
+
+app.on(
+  'window-all-closed',
+
+  () => {
+    if (process.platform !== 'darwin') {
+      app.quit();
+    }
+  }
+);
