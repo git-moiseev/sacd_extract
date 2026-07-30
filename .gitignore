@@ -90,3 +90,6 @@ typings/
 
 # Electron-Forge
 out/
+
+# Distribution archives
+sacd-extract-gui-win32-x64.zip

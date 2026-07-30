@@ -8,7 +8,7 @@ This repository packages a GUI that drives the `sacd_extract` tool to extract au
 
 ## Windows distribution
 
-For Windows you can use the prebuilt archive [sacd-extract-gui-win32-x64.zip](sacd-extract-gui-win32-x64.zip) located in the project root. Download or copy that ZIP, extract it on your computer, then run `sacd-extract-gui.exe` from the extracted folder.
+For Windows you can use the prebuilt archive available at https://drive.google.com/file/d/1sr6GenMgPHOp9V2HX7M5FqMGyeAk56iy/view?usp=sharing. Download or copy that ZIP, extract it on your computer, then run `sacd-extract-gui.exe` from the extracted folder.
 
 ## Requirements
 
