@@ -314,6 +314,11 @@ function createWindow() {
 function getExtractorPath() {
   const candidates = [
     path.join(
+      process.resourcesPath,
+      'sacd_extract.exe'
+    ),
+
+    path.join(
       __dirname,
       '..',
       'sacd_extract.exe'
@@ -321,11 +326,6 @@ function getExtractorPath() {
 
     path.join(
       __dirname,
-      'sacd_extract.exe'
-    ),
-
-    path.join(
-      process.resourcesPath,
       'sacd_extract.exe'
     ),
   ];
