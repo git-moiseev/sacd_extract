@@ -24,7 +24,7 @@
         </div>
         <div class="power-led" title="Extractor status">
           <span id="engineLed" class="power-led-dot on"></span>
-          <span id="engineStatus">sacd_extract.exe ready</span>
+          <span id="engineStatus">Waiting for sacd_extract.exe</span>
         </div>
       </header>
 
@@ -137,13 +137,21 @@
   title="Start extraction"
 >
   <svg
-    id="startIcon"
+    id="waitIcon"
     viewBox="0 0 24 24"
     aria-hidden="true"
   >
-    <path d="M12 2v10"></path>
-    <path d="m8 8 4 4 4-4"></path>
-    <path d="M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"></path>
+    <path d="M8 6v12"></path>
+    <path d="M16 6v12"></path>
+  </svg>
+
+  <svg
+    id="startIcon"
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    hidden
+  >
+    <path d="m8 5 10 7-10 7z"></path>
   </svg>
 
   <svg

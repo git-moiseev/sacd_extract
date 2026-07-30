@@ -5,6 +5,7 @@ const {
   BrowserWindow,
   dialog,
   ipcMain,
+  Menu,
 } = require('electron');
 
 const {
@@ -20,11 +21,72 @@ let extractionProcess = null;
 let outputWatcher = null;
 let outputScanTimer = null;
 let cancellationRequested = false;
+let extractorVersion = null;
+let extractorVersionPromise = null;
 
 let detectedTrackFiles = new Set();
 let initialAudioFiles = new Set();
 let initialAudioFileStats = new Map();
 let trackCounter = 0;
+
+
+function getPreferencesPath() {
+  return path.join(
+    app.getPath('userData'),
+    'preferences.json'
+  );
+}
+
+
+function readLastIsoDirectory() {
+  try {
+    const preferences = JSON.parse(
+      fs.readFileSync(
+        getPreferencesPath(),
+        'utf8'
+      )
+    );
+
+    if (
+      preferences.lastIsoDirectory &&
+      fs.existsSync(preferences.lastIsoDirectory)
+    ) {
+      return preferences.lastIsoDirectory;
+    }
+  } catch {
+    // Missing or invalid preferences are treated as a first launch.
+  }
+
+  return null;
+}
+
+
+function saveLastIsoDirectory(directory) {
+  try {
+    const preferencesPath =
+      getPreferencesPath();
+
+    fs.mkdirSync(
+      path.dirname(preferencesPath),
+      { recursive: true }
+    );
+
+    fs.writeFileSync(
+      preferencesPath,
+      JSON.stringify(
+        { lastIsoDirectory: directory },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch (error) {
+    console.warn(
+      'Unable to save last ISO directory:',
+      error.message
+    );
+  }
+}
 
 
 /*
@@ -73,6 +135,103 @@ function sendExtractorOutput(source, data) {
 }
 
 
+function parseExtractorVersion(output) {
+  const match = String(output || '').match(
+    /sacd_extract\s+client\s+([^\s\r\n]+)/i
+  );
+
+  return match?.[1] || null;
+}
+
+
+function verifyExtractorVersion() {
+  if (extractorVersionPromise) {
+    return extractorVersionPromise;
+  }
+
+  extractorVersionPromise = new Promise((resolve, reject) => {
+    let extractorPath;
+
+    try {
+      extractorPath = getExtractorPath();
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    const versionProcess = spawn(
+      extractorPath,
+      ['-v'],
+      {
+        cwd: path.dirname(extractorPath),
+        windowsHide: true,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+
+    let output = '';
+
+    versionProcess.stdout.on('data', (data) => {
+      output += data.toString('utf8');
+    });
+
+    versionProcess.stderr.on('data', (data) => {
+      output += data.toString('utf8');
+    });
+
+    versionProcess.once('error', reject);
+
+    versionProcess.once('close', (exitCode) => {
+      const version = parseExtractorVersion(output);
+
+      if (exitCode !== 0 || !version) {
+        reject(new Error(
+          'sacd_extract.exe version check failed.'
+        ));
+        return;
+      }
+
+      extractorVersion = version;
+      resolve({
+        path: extractorPath,
+        version,
+      });
+    });
+  });
+
+  return extractorVersionPromise;
+}
+
+
+function installContextMenu() {
+  mainWindow.webContents.on(
+    'context-menu',
+    (_event, params) => {
+      const menuItems = [
+        {
+          role: 'copy',
+          enabled: Boolean(params.selectionText),
+        },
+        {
+          role: 'selectAll',
+        },
+      ];
+
+      if (params.isEditable) {
+        menuItems.push({
+          role: 'paste',
+        });
+      }
+
+      Menu.buildFromTemplate(menuItems).popup({
+        window: mainWindow,
+      });
+    }
+  );
+}
+
+
 /*
  * Create the main application window.
  */
@@ -102,6 +261,33 @@ function createWindow() {
       __dirname,
       'index.html'
     )
+  );
+
+  installContextMenu();
+
+  mainWindow.webContents.once(
+    'did-finish-load',
+    async () => {
+      try {
+        const result = await verifyExtractorVersion();
+
+        sendToRenderer(
+          'sacd:status',
+          {
+            state: 'engine-ready',
+            version: result.version,
+          }
+        );
+      } catch (error) {
+        sendToRenderer(
+          'sacd:status',
+          {
+            state: 'engine-error',
+            message: error.message,
+          }
+        );
+      }
+    }
   );
 
   mainWindow.on('closed', () => {
@@ -270,6 +456,63 @@ function collectAudioFiles(directory) {
   scan(directory);
 
   return result;
+}
+
+
+/*
+ * Ask before removing audio files that the extractor may overwrite.
+ */
+async function confirmAndRemoveExistingAudioFiles(outputDirectory) {
+  const existingFiles =
+    collectAudioFiles(outputDirectory);
+
+  if (existingFiles.size === 0) {
+    return {
+      confirmed: true,
+      removed: 0,
+    };
+  }
+
+  const result =
+    await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: 'Файлы уже существуют',
+      message:
+        `В папке уже есть ${existingFiles.size} ` +
+        'файлов DSF/DFF.',
+      detail:
+        'Удалить существующие файлы и создать новые?\n\n' +
+        outputDirectory,
+      buttons: [
+        'Перезаписать',
+        'Отмена',
+      ],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+
+  if (result.response !== 0) {
+    return {
+      confirmed: false,
+      removed: 0,
+    };
+  }
+
+  let removed = 0;
+
+  for (const filePath of existingFiles) {
+    fs.rmSync(filePath, {
+      force: true,
+    });
+
+    removed += 1;
+  }
+
+  return {
+    confirmed: true,
+    removed,
+  };
 }
 
 
@@ -521,9 +764,14 @@ ipcMain.handle(
   'dialog:select-iso',
 
   async () => {
+    const lastIsoDirectory =
+      readLastIsoDirectory();
+
     const result =
       await dialog.showOpenDialog({
         title: 'Select SACD ISO',
+
+        defaultPath: lastIsoDirectory || undefined,
 
         properties: [
           'openFile',
@@ -549,7 +797,13 @@ ipcMain.handle(
       return null;
     }
 
-    return result.filePaths[0];
+    const selectedPath = result.filePaths[0];
+
+    saveLastIsoDirectory(
+      path.dirname(selectedPath)
+    );
+
+    return selectedPath;
   }
 );
 
@@ -645,8 +899,24 @@ ipcMain.handle(
         );
       }
 
+      const overwriteResult =
+        await confirmAndRemoveExistingAudioFiles(
+          options.output
+        );
+
+      if (!overwriteResult.confirmed) {
+        return {
+          success: false,
+          cancelled: true,
+          error: 'Extraction was cancelled.',
+        };
+      }
+
+      const extractorCheck =
+        await verifyExtractorVersion();
+
       const extractorPath =
-        getExtractorPath();
+        extractorCheck.path;
 
       const args =
         buildExtractorArguments(options);

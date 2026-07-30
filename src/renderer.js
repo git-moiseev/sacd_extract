@@ -21,6 +21,9 @@ const extractButton =
 const startIcon =
   document.getElementById('startIcon');
 
+const waitIcon =
+  document.getElementById('waitIcon');
+
 const stopIcon =
   document.getElementById('stopIcon');
 
@@ -51,6 +54,8 @@ const progressBar =
 const trackStatus =
   document.getElementById('trackStatus');
 
+// here
+
 const elapsedStatus =
   document.getElementById('elapsedStatus');
 
@@ -65,6 +70,8 @@ const logOutput =
 
 
 let extractionRunning = false;
+let extractorReady = false;
+let extractorVersionText = '';
 let extractionStartedAt = null;
 let elapsedTimer = null;
 let logBuffer = '';
@@ -111,8 +118,21 @@ function setEngineState(state, message) {
 }
 
 
+function formatExtractorVersion(version) {
+  const value = String(version || '');
+  const match = value.match(/^(.*-\d+)-g([0-9a-f]+)$/i);
+
+  if (!match) {
+    return value;
+  }
+
+  return `${match[1]}-...${match[2].slice(-6)}`;
+}
+
+
 function updateStartAvailability() {
   if (extractionRunning) {
+    setExtractionButtonState('processing');
     extractButton.disabled = false;
     return;
   }
@@ -123,12 +143,21 @@ function updateStartAvailability() {
   const outputSelected =
     outputPath.value.trim().length > 0;
 
+  const hasSelection =
+    sourceSelected && outputSelected;
+
   extractButton.disabled =
-    !(sourceSelected && outputSelected);
+    !(hasSelection && extractorReady);
+
+  setExtractionButtonState(
+    hasSelection
+      ? 'ready'
+      : 'waiting'
+  );
 
   if (!sourceSelected) {
     primaryStatus.textContent =
-      'Select an ISO file';
+      'Wait for ISO';
 
     secondaryStatus.textContent =
       'Select the source ISO and destination folder.';
@@ -147,7 +176,7 @@ function updateStartAvailability() {
   }
 
   primaryStatus.textContent =
-    'Ready to extract';
+    'Ready';
 
   secondaryStatus.textContent =
     'Choose the extraction options and press Start.';
@@ -183,6 +212,44 @@ function setOutput(filePath) {
 }
 
 
+function setExtractionButtonState(state) {
+  extractButton.classList.remove(
+    'state-waiting',
+    'state-ready',
+    'state-processing'
+  );
+
+  extractButton.classList.add(
+    `state-${state}`
+  );
+
+  if (waitIcon) {
+    waitIcon.hidden = state !== 'waiting';
+  }
+
+  if (startIcon) {
+    startIcon.hidden = state !== 'ready';
+  }
+
+  if (stopIcon) {
+    stopIcon.hidden = state !== 'processing';
+  }
+
+  const labels = {
+    waiting: 'Waiting for ISO',
+    ready: 'Ready to go',
+    processing: 'Processing',
+  };
+
+  extractButton.setAttribute(
+    'aria-label',
+    labels[state]
+  );
+
+  extractButton.title = labels[state];
+}
+
+
 function setRunningUi(running) {
   extractionRunning = running;
 
@@ -199,25 +266,11 @@ function setRunningUi(running) {
   document.getElementById('exportCuesheet').disabled =
     running;
 
-if (startIcon) {
-  startIcon.hidden = running;
-}
-
-if (stopIcon) {
-  stopIcon.hidden = !running;
-}
-
-  extractButton.setAttribute(
-    'aria-label',
+  setExtractionButtonState(
     running
-      ? 'Cancel extraction'
-      : 'Start extraction'
+      ? 'processing'
+      : 'waiting'
   );
-
-  extractButton.title =
-    running
-      ? 'Cancel extraction'
-      : 'Start extraction';
 
   extractButton.disabled =
     running
@@ -226,6 +279,7 @@ if (stopIcon) {
           sourcePath.value.trim() &&
           outputPath.value.trim()
         );
+
 }
 
 
@@ -438,8 +492,40 @@ function installIpcListeners() {
 
       if (status.state === 'running') {
         setRunningUi(true);
+            primaryStatus.textContent =
+              'Processing';
+
+            setEngineState(
+              'running',
+              'Processing'
+            );
         return;
       }
+
+          if (status.state === 'engine-ready') {
+            extractorReady = true;
+
+            setEngineState(
+              'ready',
+              `sacd_extract client ` +
+              `${formatExtractorVersion(status.version)} ready`
+            );
+
+            updateStartAvailability();
+            return;
+          }
+
+          if (status.state === 'engine-error') {
+            extractorReady = false;
+
+            setEngineState(
+              'error',
+              status.message || 'Extractor unavailable'
+            );
+
+            updateStartAvailability();
+            return;
+          }
 
       if (status.state === 'completed') {
         finishSuccessfully();
@@ -565,6 +651,16 @@ async function startExtraction() {
     return;
   }
 
+  if (!extractorReady) {
+    primaryStatus.textContent =
+      'Wait for extractor';
+
+    secondaryStatus.textContent =
+      'sacd_extract.exe version check is still running.';
+
+    return;
+  }
+
   setRunningUi(true);
   resetProgress();
   startElapsedTimer();
@@ -577,7 +673,7 @@ async function startExtraction() {
 
   setEngineState(
     'running',
-    'Extractor running'
+        'Processing'
   );
 
   logBuffer = '';
@@ -593,6 +689,14 @@ async function startExtraction() {
   try {
     const result =
       await window.sacd.startExtraction(options);
+
+    if (result?.cancelled) {
+      finishCancelled(
+        'Extraction was not started.'
+      );
+
+      return;
+    }
 
     if (!result?.success) {
       finishWithError(
@@ -677,14 +781,15 @@ function finishSuccessfully(message) {
   setProgress(100, 'Completed');
 
   primaryStatus.textContent =
-    'Extraction completed';
+    'Wait for ISO';
 
   secondaryStatus.textContent =
     message || 'The output files are ready.';
 
   setEngineState(
     'ready',
-    'sacd_extract.exe ready'
+    extractorVersionText ||
+    'Waiting for sacd_extract.exe'
   );
 
   appendLog('\n[done] Extraction completed successfully.\n');
@@ -725,14 +830,15 @@ function finishCancelled(message) {
     'Cancelled';
 
   primaryStatus.textContent =
-    'Extraction cancelled';
+    'Wait for ISO';
 
   secondaryStatus.textContent =
     message || 'The extraction process was stopped.';
 
   setEngineState(
     'ready',
-    'sacd_extract.exe ready'
+    extractorVersionText ||
+    'Waiting for sacd_extract.exe'
   );
 
   appendLog('\n[cancelled] Extraction stopped.\n');
@@ -809,11 +915,37 @@ function installIpcListeners() {
       }
 
       switch (status.state) {
+        case 'engine-ready':
+          extractorReady = true;
+          extractorVersionText =
+            `sacd_extract client ` +
+            `${formatExtractorVersion(status.version)} ready`;
+
+          setEngineState(
+            'ready',
+            extractorVersionText
+          );
+
+          updateStartAvailability();
+          break;
+
+        case 'engine-error':
+          extractorReady = false;
+          extractorVersionText = '';
+
+          setEngineState(
+            'error',
+            status.message || 'Extractor unavailable'
+          );
+
+          updateStartAvailability();
+          break;
+
         case 'running':
           setRunningUi(true);
 
           primaryStatus.textContent =
-            'Extracting…';
+            'Processing';
 
           secondaryStatus.textContent =
             status.message ||
@@ -821,7 +953,7 @@ function installIpcListeners() {
 
           setEngineState(
             'running',
-            'Extractor running'
+            'Processing'
           );
 
           break;
@@ -898,8 +1030,8 @@ installIpcListeners();
 
 if (hasPreloadApi()) {
   setEngineState(
-    'ready',
-    'sacd_extract.exe ready'
+    'off',
+    'Waiting for sacd_extract.exe'
   );
 } else {
   setEngineState(
